@@ -1,0 +1,7 @@
+kagglehub==1.0.2
+pandas==3.0.3
+langgraph==1.0.3
+chainlit==2.9.0
+openai==2.8.0
+plotly==6.4.0
+python-dotenv==1.2.1
