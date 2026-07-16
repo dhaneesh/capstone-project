@@ -520,3 +520,82 @@ def check_scope(state: AgentState) -> str:
     if state.get("is_in_scope", True):
         return "in_scope"
     return "out_of_scope"
+
+def create_text2sql_graph():
+    """Create the LangGraph state graph for Text2SQL with graph generation"""
+    workflow = StateGraph(AgentState)
+    workflow.add_node("guardrails_agent", guardrails_agent)
+    workflow.add_node("sql_agent", sql_agent)
+    workflow.add_node("execute_sql", execute_sql)
+    workflow.add_node("analysis_agent", analysis_agent)
+    workflow.add_node("error_agent", error_agent)
+    workflow.add_node("decide_graph_need", decide_graph_need)
+    workflow.add_node("viz_agent", viz_agent)
+
+    workflow.set_entry_point(guardrails_agent)
+
+    workflow.add_conditional_edges(
+        "guardrails_agent",
+        check_scope,
+        {
+            "in_scope": "sql_agent",
+            "out_of_scope": END
+        }
+    )
+    
+    workflow.add_edge("sql_agent", "execute_sql")
+    workflow.add_conditional_edges(
+        "execute_sql",
+        should_retry,
+        {
+            "success": "analysis_agent",
+            "retry": "error_agent",
+            "end": "analysis_agent"
+        }
+    )
+    workflow.add_edge("error_agent", "execute_sql")
+    workflow.add_edge("analysis_agent", "decide_graph_need")
+
+    workflow.add_conditional_edges(
+        "decide_graph_need",
+        should_generate_graph,
+        {
+            "viz_agent": "viz_agent",
+            "skip_agent": END
+        }
+    )
+    workflow.add_edge("viz_agent", END)
+    
+    return workflow.compile()
+
+text2sql_graph = create_text2sql_graph()
+
+
+def generate_graph_visualization(output_path: str = "text2sql_workflow.png") -> str:
+    """
+    Generate a PNG visualization of the LangGraph workflow.
+    
+    Args:
+        output_path: Path where the PNG file will be saved (default: "text2sql_workflow.png")
+    
+    Returns:
+        str: Path to the generated PNG file
+    """
+    try:
+        # Get the graph visualization
+        graph_image = text2sql_graph.get_graph().draw_mermaid_png()
+        
+        # Save to file
+        with open(output_path, "wb") as f:
+            f.write(graph_image)
+        
+        print(f"Graph visualization saved to: {output_path}")
+        return output_path
+        
+    except Exception as e:
+        print(f"Error generating graph visualization: {e}")
+        print("Make sure you have 'pygraphviz' or 'grandalf' installed:")
+        print("  pip install pygraphviz")
+        print("  or")
+        print("  pip install grandalf")
+        return None
