@@ -599,3 +599,82 @@ def generate_graph_visualization(output_path: str = "text2sql_workflow.png") -> 
         print("  or")
         print("  pip install grandalf")
         return None
+    
+async def process_question_stream(question: str):
+    """
+    Process a natural language question and stream node execution events.
+    This is an async generator that yields node events for debugging visualization.
+    
+    Yields:
+        dict: Event with type ('node_start', 'node_end', 'error', 'final') and data
+    """
+    initial_state = AgentState(
+        question=question,
+        sql_query="",
+        query_result="",
+        final_answer="",
+        error="",
+        iteration=0,
+        needs_graph=False,
+        graph_type="",
+        graph_json="",
+        is_in_scope=True
+    )
+    
+    current_state = initial_state.copy()
+    
+    try:
+        # Stream events from the graph
+        async for event in text2sql_graph.astream_events(
+            initial_state,
+            config={"recursion_limit": 50},
+            version="v1"
+        ):
+            event_type = event.get("event")
+            
+            # Node start event
+            if event_type == "on_chain_start":
+                node_name = event.get("name", "")
+                if node_name in ["check_guardrails", "generate_sql", "execute_sql", "generate_answer", 
+                               "handle_error", "decide_graph_need", "generate_graph"]:
+                    yield {
+                        "type": "node_start",
+                        "node": node_name,
+                        "input": current_state
+                    }
+            
+            # Node end event
+            elif event_type == "on_chain_end":
+                node_name = event.get("name", "")
+                if node_name in ["check_guardrails", "generate_sql", "execute_sql", "generate_answer", 
+                               "handle_error", "decide_graph_need", "generate_graph"]:
+                    output = event.get("data", {}).get("output", {})
+                    if output:
+                        current_state.update(output)
+                        yield {
+                            "type": "node_end",
+                            "node": node_name,
+                            "output": output,
+                            "state": current_state.copy()
+                        }
+        
+        # Send final result
+        yield {
+            "type": "final",
+            "result": current_state
+        }
+        
+    except Exception as e:
+        yield {
+            "type": "error",
+            "error": str(e)
+        }
+
+
+if __name__ == "__main__":
+    # Test the agent
+    print("=" * 80)
+    print("Text2SQL Agent - Use 'chainlit run app.py' to start the web interface")
+    print("=" * 80)
+    print("\nThis module is meant to be imported and used via the Chainlit app.")
+    print("Run: chainlit run app.py")
