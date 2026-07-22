@@ -7,8 +7,19 @@ import json
 import pandas as pd
 
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+client = None
 DB_PATH = "ecommerce.db"
+
+
+def get_openai_client():
+    """Create the OpenAI client lazily so the module can be imported without an API key."""
+    global client
+    if client is None:
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY is not configured. Set it before running the agent.")
+        client = OpenAI(api_key=api_key)
+    return client
 
 # Database schema information
 SCHEMA_INFO = """
@@ -166,10 +177,11 @@ Analyze the question and respond in JSON format:
 If the question is a greeting, mark is_greeting as true and is_in_scope as false.
 If the question is ambiguous but could potentially relate to the e-commerce data, mark it as in_scope."""
     
-    response = client.chat.completions.create(
+    openai_client = get_openai_client()
+    response = openai_client.chat.completions.create(
         model = "gpt-4o-mini",
         messages = [
-            {"role": "system", "content": AGENT_CONFIG['guardrails_agent']},
+            {"role": "system", "content": AGENT_CONFIG['guardrails_agent']['system_prompt']},
             {"role": "user", "content": prompt}
         ],
         temperature=0,
@@ -212,10 +224,11 @@ Important Guidelines:
 
 Generate the SQL query:"""
     
-    response = client.chat.completions.create(
+    openai_client = get_openai_client()
+    response = openai_client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
-            {"role": "system", "content": AGENT_CONFIGS["sql_agent"]["system_prompt"]},
+            {"role": "system", "content": AGENT_CONFIG["sql_agent"]["system_prompt"]},
             {"role": "user", "content": prompt}
         ],
         temperature=0
@@ -235,7 +248,7 @@ def execute_sql(state: AgentState) -> AgentState:
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
-        sql_statements = [stmt.strip() for stmt in sql_query.spit(';') if stmt.strip()]
+        sql_statements = [stmt.strip() for stmt in sql_query.split(';') if stmt.strip()]
         all_results = []
 
         for i, statement in enumerate(sql_statements):
@@ -297,10 +310,11 @@ Error: {error}
 
 Generate a corrected SQL query that will work. Return ONLY the SQL query without any explanation or markdown formatting:"""
 
-    response = client.chat.completions.create(
+    openai_client = get_openai_client()
+    response = openai_client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
-            {"role": "system", "content": AGENT_CONFIGS["error_agent"]["system_prompt"]},
+            {"role": "system", "content": AGENT_CONFIG["error_agent"]["system_prompt"]},
             {"role": "user", "content": prompt}
         ],
         temperature=0
@@ -337,10 +351,11 @@ Use bullet points or numbered lists for multiple answers.
 
 Answer:"""
 
-    response = client.chat.completions.create(
+    openai_client = get_openai_client()
+    response = openai_client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
-            {"role": "system", "content": AGENT_CONFIGS["analysis_agent"]["system_prompt"]},
+            {"role": "system", "content": AGENT_CONFIG["analysis_agent"]["system_prompt"]},
             {"role": "user", "content": prompt}
         ],
         temperature=0
@@ -442,10 +457,11 @@ Requirements:
 
 Generate the Plotly code:"""
 
-        response = client.chat.completions.create(
+        openai_client = get_openai_client()
+        response = openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": AGENT_CONFIGS["viz_agent"]["system_prompt"]},
+                {"role": "system", "content": AGENT_CONFIG["viz_agent"]["system_prompt"]},
                 {"role": "user", "content": prompt}
             ],
             temperature=0
@@ -532,7 +548,7 @@ def create_text2sql_graph():
     workflow.add_node("decide_graph_need", decide_graph_need)
     workflow.add_node("viz_agent", viz_agent)
 
-    workflow.set_entry_point(guardrails_agent)
+    workflow.set_entry_point("guardrails_agent")
 
     workflow.add_conditional_edges(
         "guardrails_agent",
@@ -561,7 +577,7 @@ def create_text2sql_graph():
         should_generate_graph,
         {
             "viz_agent": "viz_agent",
-            "skip_agent": END
+            "skip_graph": END
         }
     )
     workflow.add_edge("viz_agent", END)
@@ -635,8 +651,8 @@ async def process_question_stream(question: str):
             # Node start event
             if event_type == "on_chain_start":
                 node_name = event.get("name", "")
-                if node_name in ["check_guardrails", "generate_sql", "execute_sql", "generate_answer", 
-                               "handle_error", "decide_graph_need", "generate_graph"]:
+                if node_name in ["guardrails_agent", "sql_agent", "execute_sql", "analysis_agent",
+                                 "error_agent", "decide_graph_need", "viz_agent"]:
                     yield {
                         "type": "node_start",
                         "node": node_name,
@@ -646,8 +662,8 @@ async def process_question_stream(question: str):
             # Node end event
             elif event_type == "on_chain_end":
                 node_name = event.get("name", "")
-                if node_name in ["check_guardrails", "generate_sql", "execute_sql", "generate_answer", 
-                               "handle_error", "decide_graph_need", "generate_graph"]:
+                if node_name in ["guardrails_agent", "sql_agent", "execute_sql", "analysis_agent",
+                                 "error_agent", "decide_graph_need", "viz_agent"]:
                     output = event.get("data", {}).get("output", {})
                     if output:
                         current_state.update(output)
