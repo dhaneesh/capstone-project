@@ -5,7 +5,10 @@ from langgraph.graph import StateGraph, END
 from openai import OpenAI
 import json
 import pandas as pd
+import logging
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 client = None
 DB_PATH = "ecommerce.db"
@@ -197,7 +200,7 @@ If the question is ambiguous but could potentially relate to the e-commerce data
     
     if not state["is_in_scope"]:
         state["final_answer"] = "I apologize, but your question appears to be out of scope. I can only answer questions about the e-commerce data, including:\n\n- Customer information and locations\n- Orders and order status\n- Products and categories\n- Sellers and their performance\n- Payment information\n- Reviews and ratings\n- Shipping and delivery data\n\nPlease ask a question related to the e-commerce database."
-
+    logger.info(f"The guardrails agent function is called with question: {question}")
     return state
 
 def sql_agent(state: AgentState) -> AgentState:
@@ -585,6 +588,7 @@ def create_text2sql_graph():
     return workflow.compile()
 
 text2sql_graph = create_text2sql_graph()
+logger.info("compiled graph: {text2sql_graph}")
 
 
 def generate_graph_visualization(output_path: str = "text2sql_workflow.png") -> str:
@@ -644,9 +648,11 @@ async def process_question_stream(question: str):
         async for event in text2sql_graph.astream_events(
             initial_state,
             config={"recursion_limit": 50},
-            version="v1"
+            version="v2"
         ):
+            logger.info(f"Received event: {event}")
             event_type = event.get("event")
+            logger.info(f"Received event type: {event_type}")
             
             # Node start event
             if event_type == "on_chain_start":
