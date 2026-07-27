@@ -15,12 +15,14 @@ import json
 import logging
 import os
 import sqlite3
-from typing import Any, TypedDict
+from typing import Any, Literal, TypeVar, TypedDict
 
 import pandas as pd
 from dotenv import load_dotenv
 from langgraph.graph import END, StateGraph
-from openai import OpenAI
+from openai import AsyncOpenAI, OpenAI
+from pydantic import BaseModel
+import plotly.express as px
 
 load_dotenv()
 
@@ -28,8 +30,10 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 client: OpenAI | None = None
+async_client: AsyncOpenAI | None = None
 DB_PATH = os.getenv("DB_PATH", "ecommerce.db")
 DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+TModel = TypeVar("TModel", bound=BaseModel)
 
 
 class AgentState(TypedDict, total=False):
@@ -45,6 +49,32 @@ class AgentState(TypedDict, total=False):
     graph_type: str
     graph_json: str
     is_in_scope: bool
+
+
+class GuardrailsDecision(BaseModel):
+    """Structured output for the guardrails agent."""
+
+    is_in_scope: bool
+    is_greeting: bool = False
+    reason: str
+
+
+class GraphDecision(BaseModel):
+    """Structured output for the graph decision agent."""
+
+    needs_graph: bool = False
+    graph_type: Literal["bar", "line", "pie", "scatter", "none"] = "none"
+    reason: str = ""
+
+
+class VisualizationSpec(BaseModel):
+    """Structured output describing the Plotly figure to construct."""
+
+    chart_type: Literal["bar", "line", "pie", "scatter"] = "bar"
+    title: str = ""
+    x_column: str | None = None
+    y_column: str | None = None
+    color_column: str | None = None
 
 
 SCHEMA_INFO = """
@@ -136,7 +166,7 @@ AGENT_CONFIG = {
     },
     "viz_agent": {
         "role": "Visualization Specialist",
-        "system_prompt": "You are a data visualization expert. Generate clean, executable Plotly code without any markdown formatting or explanations.",
+        "system_prompt": "You are a data visualization expert. Return a structured Plotly chart specification without markdown formatting or explanation.",
     },
     "error_agent": {
         "role": "Error Recovery Specialist",
@@ -156,73 +186,18 @@ def get_openai_client() -> OpenAI:
     return client
 
 
-def call_openai_model(
-    *,
-    system_prompt: str,
-    user_prompt: str,
-    response_format: str | None = None,
-    model: str | None = None,
-    temperature: float = 0.0,
-) -> str:
-    """Call the OpenAI model using the latest Responses API when available."""
-    openai_client = get_openai_client()
-
-    try:
-        kwargs: dict[str, Any] = {
-            "model": model or DEFAULT_MODEL,
-            "input": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            "temperature": temperature,
-        }
-        if response_format == "json_object":
-            kwargs["text"] = {"format": {"type": "json_object"}}
-
-        response = openai_client.responses.create(**kwargs)
-        return getattr(response, "output_text", "").strip()
-    except Exception:
-        kwargs = {
-            "model": model or DEFAULT_MODEL,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            "temperature": temperature,
-        }
-        if response_format == "json_object":
-            kwargs["response_format"] = {"type": "json_object"}
-
-        response = openai_client.chat.completions.create(**kwargs)
-        return response.choices[0].message.content.strip()
+def get_async_openai_client() -> AsyncOpenAI:
+    """Create the asynchronous OpenAI client lazily so async workflows can use it."""
+    global async_client
+    if async_client is None:
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY is not configured. Set it before running the agent.")
+        async_client = AsyncOpenAI(api_key=api_key)
+    return async_client
 
 
-def sanitize_sql_response(raw_sql: str) -> str:
-    """Remove markdown fences and surrounding whitespace from generated SQL."""
-    return raw_sql.replace("```sql", "").replace("```", "").strip()
-
-
-def create_initial_state(question: str) -> AgentState:
-    """Create a fresh workflow state for a new question."""
-    return {
-        "question": question,
-        "sql_query": "",
-        "query_result": "",
-        "final_answer": "",
-        "error": "",
-        "iteration": 0,
-        "needs_graph": False,
-        "graph_type": "",
-        "graph_json": "",
-        "is_in_scope": True,
-    }
-
-
-def guardrails_agent(state: AgentState) -> AgentState:
-    """Check if the question is within scope and handle greetings."""
-    question = state["question"]
-
-    prompt = f"""You are a guardrails system for an e-commerce database chatbot. Your job is to determine if a user's question is related to e-commerce data, if it's a greeting, or if it's out of scope.
+GUARDRAILS_PROMPT_TEMPLATE = """You are a guardrails system for an e-commerce database chatbot. Your job is to determine if a user's question is related to e-commerce data, if it's a greeting, or if it's out of scope.
 
 The chatbot has access to an e-commerce database with information about:
 - Customers and their locations
@@ -254,7 +229,7 @@ Examples of OUT-OF-SCOPE questions:
 
 User Question: {question}
 
-Analyze the question and respond in JSON format:
+Analyze the question and respond in JSON format with the required fields:
 {{
     "is_in_scope": true/false,
     "is_greeting": true/false,
@@ -262,16 +237,259 @@ Analyze the question and respond in JSON format:
 }}
 
 If the question is a greeting, mark is_greeting as true and is_in_scope as false.
-If the question is ambiguous but could potentially relate to the e-commerce data, mark it as in_scope."""
+If the question is ambiguous but could potentially relate to the e-commerce data, mark it as in_scope.
+"""
 
-    response_text = call_openai_model(
+SQL_PROMPT_TEMPLATE = """You are a SQL expert. Convert the following natural language question into a valid SQLite query.
+
+{schema_info}
+
+Question: {question}
+
+Important Guidelines:
+1. Use only the tables and columns mentioned in the schema.
+2. Use proper JOIN clauses when querying multiple tables.
+3. Return ONLY the SQL query without any explanation or markdown formatting.
+4. If the question contains multiple sub-questions, generate separate SQL queries separated by semicolons.
+5. Use aggregate functions (COUNT, SUM, AVG, etc.) appropriately.
+6. Add LIMIT clauses for queries that might return many rows (default LIMIT 10 unless user specifies).
+7. Use proper WHERE clauses to filter data.
+8. For date comparisons, the dates are stored as TEXT in ISO format.
+9. Each SQL statement should be on its own line for clarity when multiple queries are needed.
+
+Generate the SQL query:"""
+
+ERROR_PROMPT_TEMPLATE = """The following SQL query failed with an error. Please fix it.
+
+{schema_info}
+
+Original Question: {question}
+
+Failed SQL Query: {sql_query}
+
+Error: {error}
+
+Generate a corrected SQL query that will work. Return ONLY the SQL query without any explanation or markdown formatting:"""
+
+ANALYSIS_PROMPT_TEMPLATE = """You are a helpful assistant that explains database query results in natural language.
+
+Original Question: {question}
+
+SQL Query Used: {sql_query}
+
+Query Results:
+{query_result}
+
+Please provide a clear, concise answer to the original question based on the query results.
+Format the answer in a user-friendly way. If the results contain numbers, present them clearly.
+If there are multiple queries/results (for multi-part questions), address each part of the question separately.
+Use bullet points or numbered lists for multiple answers.
+
+Answer:"""
+
+GRAPH_DECISION_PROMPT_TEMPLATE = """Analyze the following question and query results to determine if a graph visualization would be helpful.
+
+Question: {question}
+
+Query Results Sample:
+{query_result}
+
+Determine:
+1. Would a graph be helpful for this data? (YES/NO)
+2. If yes, what type of graph? (bar, line, pie, scatter)
+
+Consider:
+- Trends over time → line chart
+- Comparisons between categories → bar chart
+- Proportions/percentages → pie chart
+- Correlations → scatter plot
+- Simple counts or single values → NO graph needed
+
+Respond in JSON format:
+{{"needs_graph": true/false, "graph_type": "bar/line/pie/scatter/none", "reason": "brief explanation"}}
+"""
+
+VIZ_SPEC_PROMPT_TEMPLATE = """Return a JSON object describing the Plotly chart to generate for the following data.
+
+Question: {question}
+Graph Type: {graph_type}
+Columns: {columns}
+Sample Data (first 5 rows): {sample_data}
+Total Rows: {row_count}
+
+Return ONLY a JSON object with these fields:
+{{
+  "chart_type": "bar|line|pie|scatter",
+  "title": "short chart title",
+  "x_column": "name of the x-axis column",
+  "y_column": "name of the y-axis column",
+  "color_column": "optional column for color grouping"
+}}
+"""
+
+
+def get_openai_client() -> OpenAI:
+    """Create the OpenAI client lazily so the module can be imported safely."""
+    global client
+    if client is None:
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY is not configured. Set it before running the agent.")
+        client = OpenAI(api_key=api_key)
+    return client
+
+
+def get_async_openai_client() -> AsyncOpenAI:
+    """Create the asynchronous OpenAI client lazily so async workflows can use it."""
+    global async_client
+    if async_client is None:
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY is not configured. Set it before running the agent.")
+        async_client = AsyncOpenAI(api_key=api_key)
+    return async_client
+
+
+def parse_structured_output(payload: str | dict[str, Any], model_cls: type[TModel]) -> TModel:
+    """Parse JSON payload into its corresponding Pydantic model."""
+    if isinstance(payload, str):
+        parsed_payload = json.loads(payload)
+    else:
+        parsed_payload = payload
+
+    if hasattr(model_cls, "model_validate"):
+        return model_cls.model_validate(parsed_payload)
+    return model_cls.parse_obj(parsed_payload)
+
+
+def call_openai_model(
+    *,
+    system_prompt: str,
+    user_prompt: str,
+    response_format: str | None = None,
+    model: str | None = None,
+    temperature: float = 0.0,
+    response_model: type[TModel] | None = None,
+) -> str | TModel:
+    """Call the OpenAI model using the latest Responses API when available."""
+    openai_client = get_openai_client()
+
+    try:
+        kwargs: dict[str, Any] = {
+            "model": model or DEFAULT_MODEL,
+            "input": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": temperature,
+        }
+        if response_format == "json_object":
+            kwargs["text"] = {"format": {"type": "json_object"}}
+
+        response = openai_client.responses.create(**kwargs)
+        response_text = getattr(response, "output_text", "").strip()
+    except Exception:
+        kwargs = {
+            "model": model or DEFAULT_MODEL,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": temperature,
+        }
+        if response_format == "json_object":
+            kwargs["response_format"] = {"type": "json_object"}
+
+        response = openai_client.chat.completions.create(**kwargs)
+        response_text = response.choices[0].message.content.strip()
+
+    if response_model is None:
+        return response_text
+    return parse_structured_output(response_text, response_model)
+
+
+async def async_call_openai_model(
+    *,
+    system_prompt: str,
+    user_prompt: str,
+    response_format: str | None = None,
+    model: str | None = None,
+    temperature: float = 0.0,
+    response_model: type[TModel] | None = None,
+) -> str | TModel:
+    """Asynchronously call the OpenAI model and optionally parse it into a Pydantic model."""
+    openai_client = get_async_openai_client()
+
+    try:
+        kwargs: dict[str, Any] = {
+            "model": model or DEFAULT_MODEL,
+            "input": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": temperature,
+        }
+        if response_format == "json_object":
+            kwargs["text"] = {"format": {"type": "json_object"}}
+
+        response = await openai_client.responses.create(**kwargs)
+        response_text = getattr(response, "output_text", "").strip()
+    except Exception:
+        kwargs = {
+            "model": model or DEFAULT_MODEL,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": temperature,
+        }
+        if response_format == "json_object":
+            kwargs["response_format"] = {"type": "json_object"}
+
+        response = await openai_client.chat.completions.create(**kwargs)
+        response_text = response.choices[0].message.content.strip()
+
+    if response_model is None:
+        return response_text
+    return parse_structured_output(response_text, response_model)
+
+
+def sanitize_sql_response(raw_sql: str) -> str:
+    """Remove markdown fences and surrounding whitespace from generated SQL."""
+    return raw_sql.replace("```sql", "").replace("```", "").strip()
+
+
+def create_initial_state(question: str) -> AgentState:
+    """Create a fresh workflow state for a new question."""
+    return {
+        "question": question,
+        "sql_query": "",
+        "query_result": "",
+        "final_answer": "",
+        "error": "",
+        "iteration": 0,
+        "needs_graph": False,
+        "graph_type": "",
+        "graph_json": "",
+        "is_in_scope": True,
+    }
+
+
+async def guardrails_agent(state: AgentState) -> AgentState:
+    """Check if the question is within scope and handle greetings."""
+    question = state["question"]
+
+    prompt = GUARDRAILS_PROMPT_TEMPLATE.format(question=question)
+
+    result = await async_call_openai_model(
         system_prompt=AGENT_CONFIG["guardrails_agent"]["system_prompt"],
         user_prompt=prompt,
         response_format="json_object",
+        response_model=GuardrailsDecision,
     )
-    result = json.loads(response_text)
-    state["is_in_scope"] = result.get("is_in_scope", False)
-    is_greeting = result.get("is_greeting", False)
+    assert isinstance(result, GuardrailsDecision)
+    state["is_in_scope"] = result.is_in_scope
+    is_greeting = result.is_greeting
 
     if is_greeting:
         state["final_answer"] = (
@@ -291,41 +509,26 @@ If the question is ambiguous but could potentially relate to the e-commerce data
     return state
 
 
-def sql_agent(state: AgentState) -> AgentState:
+async def sql_agent(state: AgentState) -> AgentState:
     """Generate a SQLite query from a natural language question."""
     question = state["question"]
     iteration = state.get("iteration", 0)
 
-    prompt = f"""You are a SQL expert. Convert the following natural language question into a valid SQLite query.
+    prompt = SQL_PROMPT_TEMPLATE.format(schema_info=SCHEMA_INFO, question=question)
 
-{SCHEMA_INFO}
-
-Question: {question}
-
-Important Guidelines:
-1. Use only the tables and columns mentioned in the schema.
-2. Use proper JOIN clauses when querying multiple tables.
-3. Return ONLY the SQL query without any explanation or markdown formatting.
-4. If the question contains multiple sub-questions, generate separate SQL queries separated by semicolons.
-5. Use aggregate functions (COUNT, SUM, AVG, etc.) appropriately.
-6. Add LIMIT clauses for queries that might return many rows (default LIMIT 10 unless user specifies).
-7. Use proper WHERE clauses to filter data.
-8. For date comparisons, the dates are stored as TEXT in ISO format.
-9. Each SQL statement should be on its own line for clarity when multiple queries are needed.
-
-Generate the SQL query:"""
-
-    raw_sql = call_openai_model(
+    raw_sql = await async_call_openai_model(
         system_prompt=AGENT_CONFIG["sql_agent"]["system_prompt"],
         user_prompt=prompt,
     )
+    if not isinstance(raw_sql, str):
+        raw_sql = str(raw_sql)
     sql_query = sanitize_sql_response(raw_sql)
     state["sql_query"] = sql_query
     state["iteration"] = iteration + 1
     return state
 
 
-def execute_sql(state: AgentState) -> AgentState:
+async def execute_sql(state: AgentState) -> AgentState:
     """Execute the generated SQL statement(s) against the local SQLite database."""
     sql_query = state["sql_query"]
 
@@ -366,7 +569,7 @@ def execute_sql(state: AgentState) -> AgentState:
     return state
 
 
-def error_agent(state: AgentState) -> AgentState:
+async def error_agent(state: AgentState) -> AgentState:
     """Retry the SQL generation workflow after an execution error."""
     error = state["error"]
     sql_query = state["sql_query"]
@@ -380,20 +583,15 @@ def error_agent(state: AgentState) -> AgentState:
         )
         return state
 
-    prompt = f"""The following SQL query failed with an error. Please fix it.
-
-{SCHEMA_INFO}
-
-Original Question: {question}
-
-Failed SQL Query: {sql_query}
-
-Error: {error}
-
-Generate a corrected SQL query that will work. Return ONLY the SQL query without any explanation or markdown formatting:"""
+    prompt = ERROR_PROMPT_TEMPLATE.format(
+        schema_info=SCHEMA_INFO,
+        question=question,
+        sql_query=sql_query,
+        error=error,
+    )
 
     corrected_query = sanitize_sql_response(
-        call_openai_model(
+        await async_call_openai_model(
             system_prompt=AGENT_CONFIG["error_agent"]["system_prompt"],
             user_prompt=prompt,
         )
@@ -404,37 +602,30 @@ Generate a corrected SQL query that will work. Return ONLY the SQL query without
     return state
 
 
-def analysis_agent(state: AgentState) -> AgentState:
+async def analysis_agent(state: AgentState) -> AgentState:
     """Generate a human-friendly explanation from the query results."""
     question = state["question"]
     sql_query = state["sql_query"]
     query_result = state["query_result"]
 
-    prompt = f"""You are a helpful assistant that explains database query results in natural language.
+    prompt = ANALYSIS_PROMPT_TEMPLATE.format(
+        question=question,
+        sql_query=sql_query,
+        query_result=query_result,
+    )
 
-Original Question: {question}
-
-SQL Query Used: {sql_query}
-
-Query Results:
-{query_result}
-
-Please provide a clear, concise answer to the original question based on the query results.
-Format the answer in a user-friendly way. If the results contain numbers, present them clearly.
-If there are multiple queries/results (for multi-part questions), address each part of the question separately.
-Use bullet points or numbered lists for multiple answers.
-
-Answer:"""
-
-    final_answer = call_openai_model(
+    final_answer = await async_call_openai_model(
         system_prompt=AGENT_CONFIG["analysis_agent"]["system_prompt"],
         user_prompt=prompt,
-    ).strip()
+    )
+    if not isinstance(final_answer, str):
+        final_answer = str(final_answer)
+    state["final_answer"] = final_answer.strip()
     state["final_answer"] = final_answer
     return state
 
 
-def decide_graph_need(state: AgentState) -> AgentState:
+async def decide_graph_need(state: AgentState) -> AgentState:
     """Decide whether a Plotly chart would add value to the answer."""
     question = state["question"]
     query_result = state["query_result"]
@@ -444,41 +635,62 @@ def decide_graph_need(state: AgentState) -> AgentState:
         state["graph_type"] = ""
         return state
 
-    prompt = f"""Analyze the following question and query results to determine if a graph visualization would be helpful.
+    prompt = GRAPH_DECISION_PROMPT_TEMPLATE.format(
+        question=question,
+        query_result=query_result[:500],
+    )
 
-Question: {question}
-
-Query Results Sample:
-{query_result[:500]}...
-
-Determine:
-1. Would a graph be helpful for this data? (YES/NO)
-2. If yes, what type of graph? (bar, line, pie, scatter)
-
-Consider:
-- Trends over time → line chart
-- Comparisons between categories → bar chart
-- Proportions/percentages → pie chart
-- Correlations → scatter plot
-- Simple counts or single values → NO graph needed
-
-Respond in JSON format:
-{{"needs_graph": true/false, "graph_type": "bar/line/pie/scatter/none", "reason": "brief explanation"}}
-"""
-
-    response_text = call_openai_model(
+    decision = await async_call_openai_model(
         system_prompt="You are a data visualization expert. Analyze queries and determine if visualization would add value.",
         user_prompt=prompt,
         response_format="json_object",
+        response_model=GraphDecision,
     )
-    decision = json.loads(response_text)
-    state["needs_graph"] = decision.get("needs_graph", False)
-    state["graph_type"] = decision.get("graph_type", "none")
+    assert isinstance(decision, GraphDecision)
+    state["needs_graph"] = decision.needs_graph
+    state["graph_type"] = decision.graph_type
     return state
 
 
-def viz_agent(state: AgentState) -> AgentState:
-    """Generate a Plotly figure from the query results using model-generated code."""
+def build_plotly_figure(df: pd.DataFrame, spec: VisualizationSpec):
+    """Construct a Plotly figure directly from a structured visualization specification."""
+    if df.empty:
+        raise ValueError("Cannot build a chart from an empty dataframe")
+
+    chart_type = spec.chart_type
+    title = spec.title or f"{chart_type.title()} Chart"
+
+    x_column = spec.x_column or df.columns[0]
+    y_column = spec.y_column or df.columns[1] if len(df.columns) > 1 else None
+
+    if chart_type == "pie":
+        if x_column is None:
+            raise ValueError("Pie charts require an x-column")
+        if y_column is None:
+            values = df[x_column].value_counts().reset_index()
+            values.columns = [x_column, "count"]
+            x_column = x_column
+            y_column = "count"
+        else:
+            values = df[[x_column, y_column]].copy()
+            values = values.rename(columns={x_column: "label", y_column: "value"})
+            return px.pie(values, names="label", values="value", title=title)
+
+    if chart_type == "bar":
+        fig = px.bar(df, x=x_column, y=y_column, color=spec.color_column, title=title)
+    elif chart_type == "line":
+        fig = px.line(df, x=x_column, y=y_column, color=spec.color_column, title=title)
+    elif chart_type == "scatter":
+        fig = px.scatter(df, x=x_column, y=y_column, color=spec.color_column, title=title)
+    else:
+        fig = px.bar(df, x=x_column, y=y_column, color=spec.color_column, title=title)
+
+    fig.update_layout(template="plotly_white", hovermode="x unified")
+    return fig
+
+
+async def viz_agent(state: AgentState) -> AgentState:
+    """Generate a Plotly figure from the query results using a structured spec."""
     query_result = state["query_result"]
     graph_type = state["graph_type"]
     question = state["question"]
@@ -493,58 +705,24 @@ def viz_agent(state: AgentState) -> AgentState:
         columns = df.columns.tolist()
         sample_data = df.head(5).to_dict("records")
 
-        prompt = f"""Generate Python code using Plotly to visualize the following data.
+        prompt = VIZ_SPEC_PROMPT_TEMPLATE.format(
+            question=question,
+            graph_type=graph_type,
+            columns=columns,
+            sample_data=json.dumps(sample_data, indent=2),
+            row_count=len(df),
+        )
 
-Question: {question}
-Graph Type: {graph_type}
-Columns: {columns}
-Sample Data (first 5 rows): {json.dumps(sample_data, indent=2)}
-Total Rows: {len(df)}
-
-Requirements:
-1. Use plotly.graph_objects or plotly.express.
-2. The data is already loaded as 'df' (a pandas DataFrame).
-3. Create an appropriate {graph_type} chart.
-4. Limit data to top 20 rows if there are many rows.
-5. Add proper titles, labels, and formatting.
-6. The figure variable must be named 'fig'.
-7. Return ONLY the Python code, no explanations or markdown.
-8. Do NOT include import statements.
-9. Do NOT include code to show the figure (no fig.show()).
-10. Make the visualization visually appealing with appropriate colors and layout.
-11. Update the layout for better interactivity (hover info, responsive sizing).
-
-Generate the Plotly code:"""
-
-        plotly_code = call_openai_model(
+        spec = await async_call_openai_model(
             system_prompt=AGENT_CONFIG["viz_agent"]["system_prompt"],
             user_prompt=prompt,
+            response_format="json_object",
+            response_model=VisualizationSpec,
         )
-        plotly_code = sanitize_sql_response(plotly_code)
+        if not isinstance(spec, VisualizationSpec):
+            spec = parse_structured_output(spec, VisualizationSpec)
 
-        exec_globals: dict[str, Any] = {"df": df, "pd": pd, "json": json}
-
-        try:
-            import plotly.express as px
-            import plotly.graph_objects as go
-
-            exec_globals["px"] = px
-            exec_globals["go"] = go
-        except ImportError:
-            import subprocess
-
-            subprocess.check_call(["pip", "install", "plotly"])
-            import plotly.express as px
-            import plotly.graph_objects as go
-
-            exec_globals["px"] = px
-            exec_globals["go"] = go
-
-        exec(plotly_code, exec_globals)
-        fig = exec_globals.get("fig")
-        if fig is None:
-            raise ValueError("Generated code did not create a 'fig' variable")
-
+        fig = build_plotly_figure(df, spec)
         state["graph_json"] = fig.to_json()
     except Exception as exc:  # pragma: no cover - defensive path
         logger.exception("Graph generation failed: %s", exc)

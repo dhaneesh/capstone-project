@@ -10,3 +10,6 @@ And How many orders were placed in 2017?
 
 Case4:
 Find the top 10 customers who spent the most money across all their orders.
+
+
+Reference: https://github.com/alphaiterations/multi-agent-chatbot/blob/main/requirements.txt
