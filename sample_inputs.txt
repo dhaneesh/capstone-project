@@ -1,0 +1,12 @@
+Case 1:
+How many orders were delivered in 2017?
+
+Case2:
+Can you tell me the yearly breakdown of total revenue generated?
+
+Case3:
+How much revenue was generated in 2018? 
+And How many orders were placed in 2017?
+
+Case4:
+Find the top 10 customers who spent the most money across all their orders.
