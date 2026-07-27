@@ -1,3 +1,13 @@
+###
+#Things learned:
+#Shallow copy vs Deep copy
+#Anotations in Python
+#Use of * and ** in function arguments
+#function getattr()
+#function json.loads()
+#Pydantic and TypedDict
+###
+
 import json
 
 # This single JSON string contains an object, an array, and a string
