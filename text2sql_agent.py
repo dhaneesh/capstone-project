@@ -1,30 +1,52 @@
+"""Text-to-SQL workflow for e-commerce analytics.
+
+This module provides a small LangGraph workflow that accepts a natural language
+question, validates scope, generates SQLite SQL, executes it against the local
+SQLite database, explains the result, and optionally creates a Plotly chart.
+
+The implementation uses a compatibility layer around the latest OpenAI Responses
+API when available and falls back to the classic chat completions API when
+needed.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
 import os
 import sqlite3
-from typing import TypedDict
-from langgraph.graph import StateGraph, END
-from openai import OpenAI
-import json
+from typing import Any, TypedDict
+
 import pandas as pd
-import logging
+from dotenv import load_dotenv
+from langgraph.graph import END, StateGraph
+from openai import OpenAI
+
+load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-client = None
-DB_PATH = "ecommerce.db"
+client: OpenAI | None = None
+DB_PATH = os.getenv("DB_PATH", "ecommerce.db")
+DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 
-def get_openai_client():
-    """Create the OpenAI client lazily so the module can be imported without an API key."""
-    global client
-    if client is None:
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            raise RuntimeError("OPENAI_API_KEY is not configured. Set it before running the agent.")
-        client = OpenAI(api_key=api_key)
-    return client
+class AgentState(TypedDict, total=False):
+    """State of the Text2SQL agent workflow."""
 
-# Database schema information
+    question: str
+    sql_query: str
+    query_result: str
+    final_answer: str
+    error: str
+    iteration: int
+    needs_graph: bool
+    graph_type: str
+    graph_json: str
+    is_in_scope: bool
+
+
 SCHEMA_INFO = """
 Database Schema for E-commerce System:
 
@@ -98,18 +120,6 @@ Database Schema for E-commerce System:
    - product_category_name (TEXT): Category name in Portuguese
    - product_category_name_english (TEXT): Category name in English
 """
-class AgentState(TypedDict):
-    """State of the agent workflow"""
-    question: str
-    sql_query: str
-    query_result: str
-    final_answer: str
-    error: str
-    iteration: bool
-    needs_graph: bool
-    graph_type: str
-    graph_json: str
-    is_in_scope: bool
 
 AGENT_CONFIG = {
     "guardrails_agent": {
@@ -131,12 +141,86 @@ AGENT_CONFIG = {
     "error_agent": {
         "role": "Error Recovery Specialist",
         "system_prompt": "You diagnose and fix SQL errors with expert knowledge of database schemas and query optimization.",
-    }
+    },
 }
 
+
+def get_openai_client() -> OpenAI:
+    """Create the OpenAI client lazily so the module can be imported safely."""
+    global client
+    if client is None:
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY is not configured. Set it before running the agent.")
+        client = OpenAI(api_key=api_key)
+    return client
+
+
+def call_openai_model(
+    *,
+    system_prompt: str,
+    user_prompt: str,
+    response_format: str | None = None,
+    model: str | None = None,
+    temperature: float = 0.0,
+) -> str:
+    """Call the OpenAI model using the latest Responses API when available."""
+    openai_client = get_openai_client()
+
+    try:
+        kwargs: dict[str, Any] = {
+            "model": model or DEFAULT_MODEL,
+            "input": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": temperature,
+        }
+        if response_format == "json_object":
+            kwargs["text"] = {"format": {"type": "json_object"}}
+
+        response = openai_client.responses.create(**kwargs)
+        return getattr(response, "output_text", "").strip()
+    except Exception:
+        kwargs = {
+            "model": model or DEFAULT_MODEL,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": temperature,
+        }
+        if response_format == "json_object":
+            kwargs["response_format"] = {"type": "json_object"}
+
+        response = openai_client.chat.completions.create(**kwargs)
+        return response.choices[0].message.content.strip()
+
+
+def sanitize_sql_response(raw_sql: str) -> str:
+    """Remove markdown fences and surrounding whitespace from generated SQL."""
+    return raw_sql.replace("```sql", "").replace("```", "").strip()
+
+
+def create_initial_state(question: str) -> AgentState:
+    """Create a fresh workflow state for a new question."""
+    return {
+        "question": question,
+        "sql_query": "",
+        "query_result": "",
+        "final_answer": "",
+        "error": "",
+        "iteration": 0,
+        "needs_graph": False,
+        "graph_type": "",
+        "graph_json": "",
+        "is_in_scope": True,
+    }
+
+
 def guardrails_agent(state: AgentState) -> AgentState:
-    """Check if the question is within scope (e-commerce related)"""
-    question = state['question']
+    """Check if the question is within scope and handle greetings."""
+    question = state["question"]
 
     prompt = f"""You are a guardrails system for an e-commerce database chatbot. Your job is to determine if a user's question is related to e-commerce data, if it's a greeting, or if it's out of scope.
 
@@ -179,32 +263,36 @@ Analyze the question and respond in JSON format:
 
 If the question is a greeting, mark is_greeting as true and is_in_scope as false.
 If the question is ambiguous but could potentially relate to the e-commerce data, mark it as in_scope."""
-    
-    openai_client = get_openai_client()
-    response = openai_client.chat.completions.create(
-        model = "gpt-4o-mini",
-        messages = [
-            {"role": "system", "content": AGENT_CONFIG['guardrails_agent']['system_prompt']},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0,
-        response_format={"type": "json_object"}
+
+    response_text = call_openai_model(
+        system_prompt=AGENT_CONFIG["guardrails_agent"]["system_prompt"],
+        user_prompt=prompt,
+        response_format="json_object",
     )
-    result = json.loads(response.choices[0].message.content)
+    result = json.loads(response_text)
     state["is_in_scope"] = result.get("is_in_scope", False)
     is_greeting = result.get("is_greeting", False)
 
     if is_greeting:
-        state["final_answer"] = "Hi! I am your e-commerce assistant. I can answer all the queries related to orders, customers, products, sellers, payments, and reviews between 2016-2018. How can I help you today?"
+        state["final_answer"] = (
+            "Hi! I am your e-commerce assistant. I can answer queries about orders, "
+            "customers, products, sellers, payments, and reviews between 2016 and 2018."
+        )
         return state
-    
+
     if not state["is_in_scope"]:
-        state["final_answer"] = "I apologize, but your question appears to be out of scope. I can only answer questions about the e-commerce data, including:\n\n- Customer information and locations\n- Orders and order status\n- Products and categories\n- Sellers and their performance\n- Payment information\n- Reviews and ratings\n- Shipping and delivery data\n\nPlease ask a question related to the e-commerce database."
-    logger.info(f"The guardrails agent function is called with question: {question}")
+        state["final_answer"] = (
+            "I apologize, but your question appears to be out of scope. I can only answer "
+            "questions about the e-commerce data, including customer information, orders, "
+            "products, sellers, payments, reviews, and shipping data."
+        )
+
+    logger.info("Guardrails agent processed question: %s", question)
     return state
 
+
 def sql_agent(state: AgentState) -> AgentState:
-    """Generate SQL query from natural language question"""
+    """Generate a SQLite query from a natural language question."""
     question = state["question"]
     iteration = state.get("iteration", 0)
 
@@ -215,92 +303,83 @@ def sql_agent(state: AgentState) -> AgentState:
 Question: {question}
 
 Important Guidelines:
-1. Use only the tables and columns mentioned in the schema
-2. Use proper JOIN clauses when querying multiple tables
-3. Return ONLY the SQL query without any explanation or markdown formatting
-4. If the question contains multiple sub-questions, generate separate SQL queries separated by semicolons
-5. Use aggregate functions (COUNT, SUM, AVG, etc.) appropriately
-6. Add LIMIT clauses for queries that might return many rows (default LIMIT 10 unless user specifies)
-7. Use proper WHERE clauses to filter data
-8. For date comparisons, remember the dates are stored as TEXT in ISO format
-9. Each SQL statement should be on its own line for clarity when multiple queries are needed
+1. Use only the tables and columns mentioned in the schema.
+2. Use proper JOIN clauses when querying multiple tables.
+3. Return ONLY the SQL query without any explanation or markdown formatting.
+4. If the question contains multiple sub-questions, generate separate SQL queries separated by semicolons.
+5. Use aggregate functions (COUNT, SUM, AVG, etc.) appropriately.
+6. Add LIMIT clauses for queries that might return many rows (default LIMIT 10 unless user specifies).
+7. Use proper WHERE clauses to filter data.
+8. For date comparisons, the dates are stored as TEXT in ISO format.
+9. Each SQL statement should be on its own line for clarity when multiple queries are needed.
 
 Generate the SQL query:"""
-    
-    openai_client = get_openai_client()
-    response = openai_client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": AGENT_CONFIG["sql_agent"]["system_prompt"]},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0
-    )
 
-    sql_query = response.choices[0].message.content.strip()
-    sql_query = sql_query.replace("```sql", "").replace("```", "").strip()
+    raw_sql = call_openai_model(
+        system_prompt=AGENT_CONFIG["sql_agent"]["system_prompt"],
+        user_prompt=prompt,
+    )
+    sql_query = sanitize_sql_response(raw_sql)
     state["sql_query"] = sql_query
     state["iteration"] = iteration + 1
-
     return state
 
+
 def execute_sql(state: AgentState) -> AgentState:
-    """Execute the generated SQL query (handles multiple queries if present)"""
+    """Execute the generated SQL statement(s) against the local SQLite database."""
     sql_query = state["sql_query"]
-    
+
     try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        sql_statements = [stmt.strip() for stmt in sql_query.split(';') if stmt.strip()]
-        all_results = []
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            sql_statements = [stmt.strip() for stmt in sql_query.split(";") if stmt.strip()]
+            all_results: list[dict[str, Any]] | list[dict[str, Any]] = []
 
-        for i, statement in enumerate(sql_statements):
-            cursor.execute(statement)
-            results = cursor.fetchall()
+            for index, statement in enumerate(sql_statements):
+                cursor.execute(statement)
+                results = cursor.fetchall()
 
-            if results:
-                column_names = [description[0] for description in cursor.description]
-                # Convert to list of dictionaries
-                formatted_results = []
-                for row in results[:100]:  # Limit to 100 rows per query
-                    formatted_results.append(dict(zip(column_names, row)))
-                
-                # If multiple queries, label them
-                if len(sql_statements) > 1:
-                    all_results.append({
-                        f"query_{i+1}": formatted_results,
-                        f"query_{i+1}_sql": statement
-                    })
-                else:
-                    all_results = formatted_results
-        conn.close()
-        
-        # Format results
+                if results:
+                    column_names = [description[0] for description in cursor.description]
+                    formatted_results = []
+                    for row in results[:100]:
+                        formatted_results.append(dict(zip(column_names, row)))
+
+                    if len(sql_statements) > 1:
+                        all_results.append({
+                            f"query_{index + 1}": formatted_results,
+                            f"query_{index + 1}_sql": statement,
+                        })
+                    else:
+                        all_results = formatted_results
+
         if not all_results:
             state["query_result"] = "No results found."
         else:
             state["query_result"] = json.dumps(all_results, indent=2)
-        
+
         state["error"] = ""
-        
-    except Exception as e:
-        state["error"] = f"SQL Execution Error: {str(e)}"
+    except Exception as exc:  # pragma: no cover - defensive path
+        state["error"] = f"SQL Execution Error: {exc}"
         state["query_result"] = ""
-    
+
     return state
-        
+
+
 def error_agent(state: AgentState) -> AgentState:
-    """Handle errors and attempt to fix the SQL query"""
+    """Retry the SQL generation workflow after an execution error."""
     error = state["error"]
     sql_query = state["sql_query"]
     question = state["question"]
     iteration = state.get("iteration", 0)
-    
-    # If we've tried too many times, give up
+
     if iteration > 3:
-        state["final_answer"] = f"I apologize, but I'm having trouble generating a correct SQL query for your question. Error: {error}"
+        state["final_answer"] = (
+            f"I apologize, but I am having trouble generating a correct SQL query for your question. "
+            f"Error: {error}"
+        )
         return state
-    
+
     prompt = f"""The following SQL query failed with an error. Please fix it.
 
 {SCHEMA_INFO}
@@ -313,31 +392,24 @@ Error: {error}
 
 Generate a corrected SQL query that will work. Return ONLY the SQL query without any explanation or markdown formatting:"""
 
-    openai_client = get_openai_client()
-    response = openai_client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": AGENT_CONFIG["error_agent"]["system_prompt"]},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0
+    corrected_query = sanitize_sql_response(
+        call_openai_model(
+            system_prompt=AGENT_CONFIG["error_agent"]["system_prompt"],
+            user_prompt=prompt,
+        )
     )
-    
-    corrected_query = response.choices[0].message.content.strip()
-    corrected_query = corrected_query.replace("```sql", "").replace("```", "").strip()
-    
     state["sql_query"] = corrected_query
-    state["error"] = ""  # Clear the error for retry
-    state["iteration"] = iteration + 1  # Increment iteration counter
-    
+    state["error"] = ""
+    state["iteration"] = iteration + 1
     return state
 
+
 def analysis_agent(state: AgentState) -> AgentState:
-    """Generate natural language answer from query results"""
+    """Generate a human-friendly explanation from the query results."""
     question = state["question"]
     sql_query = state["sql_query"]
     query_result = state["query_result"]
-    
+
     prompt = f"""You are a helpful assistant that explains database query results in natural language.
 
 Original Question: {question}
@@ -354,32 +426,24 @@ Use bullet points or numbered lists for multiple answers.
 
 Answer:"""
 
-    openai_client = get_openai_client()
-    response = openai_client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": AGENT_CONFIG["analysis_agent"]["system_prompt"]},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0
-    )
-    
-    final_answer = response.choices[0].message.content.strip()
+    final_answer = call_openai_model(
+        system_prompt=AGENT_CONFIG["analysis_agent"]["system_prompt"],
+        user_prompt=prompt,
+    ).strip()
     state["final_answer"] = final_answer
-    
     return state
 
+
 def decide_graph_need(state: AgentState) -> AgentState:
-    """Decide if a graph visualization would be helpful for the query"""
+    """Decide whether a Plotly chart would add value to the answer."""
     question = state["question"]
     query_result = state["query_result"]
-    
-    # If no results or error, no graph needed
+
     if not query_result or query_result == "No results found." or state.get("error"):
         state["needs_graph"] = False
         state["graph_type"] = ""
         return state
-    
+
     prompt = f"""Analyze the following question and query results to determine if a graph visualization would be helpful.
 
 Question: {question}
@@ -402,41 +466,33 @@ Respond in JSON format:
 {{"needs_graph": true/false, "graph_type": "bar/line/pie/scatter/none", "reason": "brief explanation"}}
 """
 
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": "You are a data visualization expert. Analyze queries and determine if visualization would add value."},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0,
-        response_format={"type": "json_object"}
+    response_text = call_openai_model(
+        system_prompt="You are a data visualization expert. Analyze queries and determine if visualization would add value.",
+        user_prompt=prompt,
+        response_format="json_object",
     )
-    
-    decision = json.loads(response.choices[0].message.content)
+    decision = json.loads(response_text)
     state["needs_graph"] = decision.get("needs_graph", False)
     state["graph_type"] = decision.get("graph_type", "none")
-    
     return state
 
+
 def viz_agent(state: AgentState) -> AgentState:
-    """Generate a graph visualization from query results using LLM-generated Plotly code"""
+    """Generate a Plotly figure from the query results using model-generated code."""
     query_result = state["query_result"]
     graph_type = state["graph_type"]
     question = state["question"]
-    
+
     try:
-        # Parse query results
         results = json.loads(query_result)
         if not results or len(results) == 0:
             state["graph_json"] = ""
             return state
-        
-        # Convert to DataFrame for context
+
         df = pd.DataFrame(results)
         columns = df.columns.tolist()
-        sample_data = df.head(5).to_dict('records')
-        
-        # Generate Plotly code using LLM
+        sample_data = df.head(5).to_dict("records")
+
         prompt = f"""Generate Python code using Plotly to visualize the following data.
 
 Question: {question}
@@ -446,102 +502,83 @@ Sample Data (first 5 rows): {json.dumps(sample_data, indent=2)}
 Total Rows: {len(df)}
 
 Requirements:
-1. Use plotly.graph_objects or plotly.express
-2. The data is already loaded as 'df' (a pandas DataFrame)
-3. Create an appropriate {graph_type} chart
-4. Limit data to top 20 rows if there are many rows
-5. Add proper titles, labels, and formatting
-6. The figure variable must be named 'fig'
-7. Return ONLY the Python code, no explanations or markdown
-8. Do NOT include any import statements
-9. Do NOT include code to show the figure (no fig.show())
-10. Make the visualization visually appealing with appropriate colors and layout
-11. Update the layout for better interactivity (hover info, responsive sizing)
+1. Use plotly.graph_objects or plotly.express.
+2. The data is already loaded as 'df' (a pandas DataFrame).
+3. Create an appropriate {graph_type} chart.
+4. Limit data to top 20 rows if there are many rows.
+5. Add proper titles, labels, and formatting.
+6. The figure variable must be named 'fig'.
+7. Return ONLY the Python code, no explanations or markdown.
+8. Do NOT include import statements.
+9. Do NOT include code to show the figure (no fig.show()).
+10. Make the visualization visually appealing with appropriate colors and layout.
+11. Update the layout for better interactivity (hover info, responsive sizing).
 
 Generate the Plotly code:"""
 
-        openai_client = get_openai_client()
-        response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": AGENT_CONFIG["viz_agent"]["system_prompt"]},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0
+        plotly_code = call_openai_model(
+            system_prompt=AGENT_CONFIG["viz_agent"]["system_prompt"],
+            user_prompt=prompt,
         )
-        
-        plotly_code = response.choices[0].message.content.strip()
-        # Remove markdown code blocks if present
-        plotly_code = plotly_code.replace("```python", "").replace("```", "").strip()
-        
-        # Prepare execution environment
-        exec_globals = {
-            'df': df,
-            'pd': pd,
-            'json': json
-        }
-        
-        # Import plotly dynamically
+        plotly_code = sanitize_sql_response(plotly_code)
+
+        exec_globals: dict[str, Any] = {"df": df, "pd": pd, "json": json}
+
         try:
-            import plotly.graph_objects as go
             import plotly.express as px
-            exec_globals['go'] = go
-            exec_globals['px'] = px
+            import plotly.graph_objects as go
+
+            exec_globals["px"] = px
+            exec_globals["go"] = go
         except ImportError:
-            print("Plotly not installed. Installing...")
             import subprocess
-            subprocess.check_call(['pip', 'install', 'plotly'])
-            import plotly.graph_objects as go
+
+            subprocess.check_call(["pip", "install", "plotly"])
             import plotly.express as px
-            exec_globals['go'] = go
-            exec_globals['px'] = px
-        
-        # Execute the generated code
+            import plotly.graph_objects as go
+
+            exec_globals["px"] = px
+            exec_globals["go"] = go
+
         exec(plotly_code, exec_globals)
-        
-        # Get the figure object
-        fig = exec_globals.get('fig')
-        
+        fig = exec_globals.get("fig")
         if fig is None:
             raise ValueError("Generated code did not create a 'fig' variable")
-        
-        # Export figure as JSON for Chainlit's Plotly element
-        graph_json = fig.to_json()
-        state["graph_json"] = graph_json
-        
-    except Exception as e:
-        print(f"Graph generation error: {e}")
-        print(f"Generated code:\n{plotly_code if 'plotly_code' in locals() else 'No code generated'}")
+
+        state["graph_json"] = fig.to_json()
+    except Exception as exc:  # pragma: no cover - defensive path
+        logger.exception("Graph generation failed: %s", exc)
         state["graph_json"] = ""
-    
+
     return state
 
+
 def should_retry(state: AgentState) -> str:
-    """Decide whether to retry after an error"""
+    """Decide whether to retry after an execution error."""
     if state.get("error"):
         iteration = state.get("iteration", 0)
         if iteration <= 3:
             return "retry"
-        else:
-            return "end"
+        return "end"
     return "success"
 
 
 def should_generate_graph(state: AgentState) -> str:
-    """Decide whether to generate a graph"""
+    """Decide whether to generate a graph for the answer."""
     if state.get("needs_graph", False):
         return "viz_agent"
     return "skip_graph"
 
 
 def check_scope(state: AgentState) -> str:
-    """Check if question is in scope to continue processing"""
+    """Check whether the question is within scope before continuing."""
     if state.get("is_in_scope", True):
         return "in_scope"
     return "out_of_scope"
 
+
 def create_text2sql_graph():
-    """Create the LangGraph state graph for Text2SQL with graph generation"""
+    """Create the LangGraph workflow for the Text2SQL experience."""
     workflow = StateGraph(AgentState)
     workflow.add_node("guardrails_agent", guardrails_agent)
     workflow.add_node("sql_agent", sql_agent)
@@ -556,145 +593,104 @@ def create_text2sql_graph():
     workflow.add_conditional_edges(
         "guardrails_agent",
         check_scope,
-        {
-            "in_scope": "sql_agent",
-            "out_of_scope": END
-        }
+        {"in_scope": "sql_agent", "out_of_scope": END},
     )
-    
     workflow.add_edge("sql_agent", "execute_sql")
     workflow.add_conditional_edges(
         "execute_sql",
         should_retry,
-        {
-            "success": "analysis_agent",
-            "retry": "error_agent",
-            "end": "analysis_agent"
-        }
+        {"success": "analysis_agent", "retry": "error_agent", "end": "analysis_agent"},
     )
     workflow.add_edge("error_agent", "execute_sql")
     workflow.add_edge("analysis_agent", "decide_graph_need")
-
     workflow.add_conditional_edges(
         "decide_graph_need",
         should_generate_graph,
-        {
-            "viz_agent": "viz_agent",
-            "skip_graph": END
-        }
+        {"viz_agent": "viz_agent", "skip_graph": END},
     )
     workflow.add_edge("viz_agent", END)
-    
+
     return workflow.compile()
 
+
 text2sql_graph = create_text2sql_graph()
-logger.info("compiled graph: {text2sql_graph}")
+logger.info("Compiled workflow graph")
 
 
-def generate_graph_visualization(output_path: str = "text2sql_workflow.png") -> str:
-    """
-    Generate a PNG visualization of the LangGraph workflow.
-    
-    Args:
-        output_path: Path where the PNG file will be saved (default: "text2sql_workflow.png")
-    
-    Returns:
-        str: Path to the generated PNG file
-    """
+def generate_graph_visualization(output_path: str = "text2sql_workflow.png") -> str | None:
+    """Render a PNG diagram of the workflow graph to disk."""
     try:
-        # Get the graph visualization
         graph_image = text2sql_graph.get_graph().draw_mermaid_png()
-        
-        # Save to file
-        with open(output_path, "wb") as f:
-            f.write(graph_image)
-        
-        print(f"Graph visualization saved to: {output_path}")
+        with open(output_path, "wb") as handle:
+            handle.write(graph_image)
+        logger.info("Workflow diagram saved to %s", output_path)
         return output_path
-        
-    except Exception as e:
-        print(f"Error generating graph visualization: {e}")
-        print("Make sure you have 'pygraphviz' or 'grandalf' installed:")
-        print("  pip install pygraphviz")
-        print("  or")
-        print("  pip install grandalf")
+    except Exception as exc:  # pragma: no cover - dependency optional
+        logger.warning("Could not generate workflow diagram: %s", exc)
         return None
-    
+
+
 async def process_question_stream(question: str):
-    """
-    Process a natural language question and stream node execution events.
-    This is an async generator that yields node events for debugging visualization.
-    
-    Yields:
-        dict: Event with type ('node_start', 'node_end', 'error', 'final') and data
-    """
-    initial_state = AgentState(
-        question=question,
-        sql_query="",
-        query_result="",
-        final_answer="",
-        error="",
-        iteration=0,
-        needs_graph=False,
-        graph_type="",
-        graph_json="",
-        is_in_scope=True
-    )
-    
-    current_state = initial_state.copy()
-    
+    """Process a question while streaming workflow events to the UI."""
+    initial_state = create_initial_state(question)
+    current_state: dict[str, Any] = dict(initial_state)
+
     try:
-        # Stream events from the graph
         async for event in text2sql_graph.astream_events(
             initial_state,
             config={"recursion_limit": 50},
-            version="v2"
+            version="v2",
         ):
-            logger.info(f"Received event: {event}")
             event_type = event.get("event")
-            logger.info(f"Received event type: {event_type}")
-            
-            # Node start event
+            node_name = event.get("name", "")
+            node_alias = {
+                "sql_agent": "generate_sql",
+                "execute_sql": "execute_sql",
+                "analysis_agent": "generate_answer",
+                "error_agent": "handle_error",
+                "decide_graph_need": "decide_graph_need",
+                "viz_agent": "generate_graph",
+                "guardrails_agent": "guardrails_agent",
+            }.get(node_name, node_name)
+
             if event_type == "on_chain_start":
-                node_name = event.get("name", "")
-                if node_name in ["guardrails_agent", "sql_agent", "execute_sql", "analysis_agent",
-                                 "error_agent", "decide_graph_need", "viz_agent"]:
-                    yield {
-                        "type": "node_start",
-                        "node": node_name,
-                        "input": current_state
-                    }
-            
-            # Node end event
+                if node_name in {
+                    "guardrails_agent",
+                    "sql_agent",
+                    "execute_sql",
+                    "analysis_agent",
+                    "error_agent",
+                    "decide_graph_need",
+                    "viz_agent",
+                }:
+                    yield {"type": "node_start", "node": node_alias, "input": current_state}
+
             elif event_type == "on_chain_end":
-                node_name = event.get("name", "")
-                if node_name in ["guardrails_agent", "sql_agent", "execute_sql", "analysis_agent",
-                                 "error_agent", "decide_graph_need", "viz_agent"]:
+                if node_name in {
+                    "guardrails_agent",
+                    "sql_agent",
+                    "execute_sql",
+                    "analysis_agent",
+                    "error_agent",
+                    "decide_graph_need",
+                    "viz_agent",
+                }:
                     output = event.get("data", {}).get("output", {})
                     if output:
                         current_state.update(output)
                         yield {
                             "type": "node_end",
-                            "node": node_name,
+                            "node": node_alias,
                             "output": output,
-                            "state": current_state.copy()
+                            "state": current_state.copy(),
                         }
-        
-        # Send final result
-        yield {
-            "type": "final",
-            "result": current_state
-        }
-        
-    except Exception as e:
-        yield {
-            "type": "error",
-            "error": str(e)
-        }
+
+        yield {"type": "final", "result": current_state}
+    except Exception as exc:  # pragma: no cover - defensive path
+        yield {"type": "error", "error": str(exc)}
 
 
 if __name__ == "__main__":
-    # Test the agent
     print("=" * 80)
     print("Text2SQL Agent - Use 'chainlit run app.py' to start the web interface")
     print("=" * 80)
