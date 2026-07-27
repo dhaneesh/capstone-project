@@ -448,7 +448,9 @@ async def async_call_openai_model(
 
         response = await openai_client.chat.completions.create(**kwargs)
         response_text = response.choices[0].message.content.strip()
-
+    logger.info("OpenAI full response: %s", response)
+    logger.info("OpenAI model response: %s", response_text)
+    logger.info("OpenAI model response model: %s", response_model)
     if response_model is None:
         return response_text
     return parse_structured_output(response_text, response_model)
@@ -487,6 +489,7 @@ async def guardrails_agent(state: AgentState) -> AgentState:
         response_format="json_object",
         response_model=GuardrailsDecision,
     )
+    logger.info("This is result from Guard Rails Agent: %s", result)
     assert isinstance(result, GuardrailsDecision)
     state["is_in_scope"] = result.is_in_scope
     is_greeting = result.is_greeting

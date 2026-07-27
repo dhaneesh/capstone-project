@@ -5,6 +5,7 @@
 #Use of * and ** in function arguments
 #function getattr()
 #function json.loads()
+#Pydantic and TypedDict
 ###
 
 import json
